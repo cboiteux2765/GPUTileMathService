@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import time
 from typing import Any, Dict
 
@@ -17,6 +18,7 @@ from .metrics import (
     job_compute_ms,
     jobs_in_memory,
 )
+from .redis_backend import RedisJobBackend
 from .schemas import (
     SubmitJobRequest,
     SubmitJobResponse,
@@ -28,6 +30,9 @@ from .store import InMemoryJobStore
 
 app = FastAPI(title="GPU Tile Math Service (Feature 1: API-only)")
 store = InMemoryJobStore()
+
+JOB_BACKEND = os.getenv("JOB_BACKEND", "inmemory").lower()
+redis_backend = RedisJobBackend() if JOB_BACKEND == "redis" else None
 
 def _deterministic_checksum(payload: Dict[str, Any]) -> str:
     b = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -90,9 +95,25 @@ def metrics() -> PlainTextResponse:
 @app.post("/v1/jobs", response_model=SubmitJobResponse)
 def submit_job(req: SubmitJobRequest) -> SubmitJobResponse:
     spec = req.spec.model_dump()
-    job_id = store.create_job(spec)
 
-    jobs_submitted_total.labels(op=spec["op"], dtype=spec["dtype"], simulate=str(spec["simulate"]).lower()).inc()
+    # metrics: submitted
+    jobs_submitted_total.labels(
+        op=spec["op"],
+        dtype=spec["dtype"],
+        simulate=str(spec["simulate"]).lower(),
+    ).inc()
+
+    if redis_backend is not None:
+        job_id = redis_backend.create_job(spec)
+        redis_backend.enqueue(job_id, spec)
+        jobs_submitted_total.labels(
+            op=spec["op"],
+            dtype=spec["dtype"],
+            simulate=str(spec["simulate"]).lower(),
+        ).inc()
+        return SubmitJobResponse(job_id=job_id)
+
+    job_id = store.create_job(spec)
 
     t0 = time.perf_counter()
     store.set_state(job_id, JobState.RUNNING)
@@ -100,7 +121,6 @@ def submit_job(req: SubmitJobRequest) -> SubmitJobResponse:
     try:
         c0 = time.perf_counter()
         if spec["simulate"]:
-            # deterministic simulated result for large shapes
             checksum = _deterministic_checksum(spec)
             result = {
                 "checksum": checksum,
@@ -131,11 +151,18 @@ def submit_job(req: SubmitJobRequest) -> SubmitJobResponse:
         store.set_result(job_id, result_summary=None, wall_time_ms=wall_ms, compute_time_ms=None)
         store.set_state(job_id, JobState.FAILED, error=str(e))
         jobs_completed_total.labels(op=spec["op"], dtype=spec["dtype"], state="failed").inc()
+
     return SubmitJobResponse(job_id=job_id)
 
 
 @app.get("/v1/jobs/{job_id}", response_model=JobStatusResponse)
 def get_job(job_id: str) -> JobStatusResponse:
+    if redis_backend is not None:
+        meta = redis_backend.get_meta(job_id)
+        if meta is None:
+            raise HTTPException(status_code=404, detail="job_id not found")
+        return JobStatusResponse(**meta)
+
     rec = store.get(job_id)
     if rec is None:
         raise HTTPException(status_code=404, detail="job_id not found")
@@ -152,9 +179,20 @@ def get_job(job_id: str) -> JobStatusResponse:
         compute_time_ms=rec.compute_time_ms,
     )
 
-
 @app.get("/v1/jobs/{job_id}/result", response_model=JobResultResponse)
 def get_result(job_id: str) -> JobResultResponse:
+    if redis_backend is not None:
+        meta = redis_backend.get_meta(job_id)
+        if meta is None:
+            raise HTTPException(status_code=404, detail="job_id not found")
+        result = redis_backend.get_result(job_id)
+        return JobResultResponse(
+            job_id=job_id,
+            state=meta["state"],
+            result_summary=result,
+            error=meta.get("error"),
+        )
+
     rec = store.get(job_id)
     if rec is None:
         raise HTTPException(status_code=404, detail="job_id not found")
@@ -165,3 +203,12 @@ def get_result(job_id: str) -> JobResultResponse:
         result_summary=rec.result_summary,
         error=rec.error,
     )
+
+@app.get("/v1/backend")
+def backend():
+    return {
+        "JOB_BACKEND": JOB_BACKEND,
+        "REDIS_URL": os.getenv("REDIS_URL"),
+        "REDIS_STREAM": os.getenv("REDIS_STREAM"),
+        "redis_enabled": redis_backend is not None,
+    }

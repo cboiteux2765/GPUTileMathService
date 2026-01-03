@@ -51,7 +51,7 @@ extract_json_path() {
   # usage: extract_json_path "a.b.c"
   # reads JSON from stdin; prints value or empty string
   local path="$1"
-  python3 - "$path" <<'PY'
+  python3 -c '
 import sys, json
 path = sys.argv[1]
 data = sys.stdin.read().strip()
@@ -61,19 +61,21 @@ try:
     obj = json.loads(data)
 except Exception:
     print(""); raise SystemExit(0)
+
 cur = obj
 for key in path.split("."):
     if isinstance(cur, dict) and key in cur:
         cur = cur[key]
     else:
         print(""); raise SystemExit(0)
+
 if cur is None:
     print("")
 elif isinstance(cur, (dict, list)):
     print(json.dumps(cur))
 else:
     print(cur)
-PY
+' "$path"
 }
 
 contains() { [[ "$1" == *"$2"* ]]; }

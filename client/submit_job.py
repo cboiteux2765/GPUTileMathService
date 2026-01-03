@@ -1,47 +1,57 @@
-import argparse
-import json
-import sys
-from urllib.request import Request, urlopen
+@app.post("/v1/jobs", response_model=SubmitJobResponse)
+def submit_job(req: SubmitJobRequest) -> SubmitJobResponse:
+    spec = req.spec.model_dump()
 
+    jobs_submitted_total.labels(
+        op=spec["op"],
+        dtype=spec["dtype"],
+        simulate=str(spec["simulate"]).lower(),
+    ).inc()
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--host", default="http://127.0.0.1:8000")
-    p.add_argument("--m", type=int, required=True)
-    p.add_argument("--n", type=int, required=True)
-    p.add_argument("--k", type=int, required=True)
-    p.add_argument("--dtype", choices=["fp16", "fp32"], default="fp32")
-    p.add_argument("--repeats", type=int, default=1)
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--simulate", action="store_true")
-    args = p.parse_args()
+    # ✅ Redis queue mode: enqueue only, do NOT execute inline
+    if redis_backend is not None:
+        job_id = redis_backend.create_job(spec)
+        redis_backend.enqueue(job_id, spec)
+        return SubmitJobResponse(job_id=job_id)
 
-    payload = {
-        "spec": {
-            "op": "gemm",
-            "m": args.m,
-            "n": args.n,
-            "k": args.k,
-            "dtype": args.dtype,
-            "repeats": args.repeats,
-            "seed": args.seed,
-            "simulate": bool(args.simulate),
-        }
-    }
+    # Feature 1 (in-memory): execute inline
+    job_id = store.create_job(spec)
 
-    body = json.dumps(payload).encode("utf-8")
-    req = Request(args.host.rstrip("/") + "/v1/jobs", data=body, headers={"Content-Type": "application/json"})
-    with urlopen(req) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    job_id = data["job_id"]
-    print("job_id:", job_id)
+    t0 = time.perf_counter()
+    store.set_state(job_id, JobState.RUNNING)
 
-    with urlopen(args.host.rstrip("/") + f"/v1/jobs/{job_id}") as resp:
-        print("status:", json.loads(resp.read().decode("utf-8")))
+    try:
+        c0 = time.perf_counter()
+        if spec["simulate"]:
+            checksum = _deterministic_checksum(spec)
+            result = {
+                "checksum": checksum,
+                "mode": "simulated",
+                "note": "Set simulate=false for tiny shapes to run CPU GEMM summary.",
+            }
+            compute_ms = (time.perf_counter() - c0) * 1000.0
+        else:
+            result = _cpu_gemm_summary(
+                m=int(spec["m"]),
+                n=int(spec["n"]),
+                k=int(spec["k"]),
+                seed=int(spec["seed"]),
+                repeats=int(spec["repeats"]),
+            )
+            compute_ms = (time.perf_counter() - c0) * 1000.0
 
-    with urlopen(args.host.rstrip("/") + f"/v1/jobs/{job_id}/result") as resp:
-        print("result:", json.loads(resp.read().decode("utf-8")))
+        wall_ms = (time.perf_counter() - t0) * 1000.0
+        store.set_result(job_id, result_summary=result, wall_time_ms=wall_ms, compute_time_ms=compute_ms)
+        store.set_state(job_id, JobState.DONE)
 
+        jobs_completed_total.labels(op=spec["op"], dtype=spec["dtype"], state="done").inc()
+        job_end_to_end_ms.labels(op=spec["op"], dtype=spec["dtype"], simulate=str(spec["simulate"]).lower()).observe(wall_ms)
+        job_compute_ms.labels(op=spec["op"], dtype=spec["dtype"], simulate=str(spec["simulate"]).lower()).observe(compute_ms)
 
-if __name__ == "__main__":
-    main()
+    except Exception as e:
+        wall_ms = (time.perf_counter() - t0) * 1000.0
+        store.set_result(job_id, result_summary=None, wall_time_ms=wall_ms, compute_time_ms=None)
+        store.set_state(job_id, JobState.FAILED, error=str(e))
+        jobs_completed_total.labels(op=spec["op"], dtype=spec["dtype"], state="failed").inc()
+
+    return SubmitJobResponse(job_id=job_id)
